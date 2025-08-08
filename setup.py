@@ -9,7 +9,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 setup(
     name="tixcraft-bot",
     version="1.0.0",
-    author="Your Name",
+    author="chong-hao",
     author_email="your.email@example.com",
     description="拓元搶票機器人 - 自動化搶票工具",
     long_description=long_description,
