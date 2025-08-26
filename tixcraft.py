@@ -16,6 +16,9 @@ from selenium.webdriver.support import expected_conditions as EC
 # GUI 輪詢間隔（ms）
 POLL_INTERVAL_MS = 200
 
+# 選區頁輪詢間隔（ms），在沒有空位時以更快頻率重試
+SEAT_POLL_INTERVAL_MS = 100
+
 # 短暫 sleep（秒），用於非動態等待的最小延遲
 SLEEP_SHORT_SEC = 0.2
 
@@ -333,10 +336,16 @@ class TixcraftGUI:
                         # 直接等待確認按鈕出現並處理
                         self._confirm_selection()
                     else:
-                        self.log('沒有找到可購買的座位區域')
+                        self.log(f'沒有找到可購買的座位區域，{SEAT_POLL_INTERVAL_MS/1000:.1f}秒後重試掃描...')
+                        if self.is_running:
+                            self.after_id = self.log_text.after(SEAT_POLL_INTERVAL_MS, self._handle_seat_selection)
+                        return
                         
                 except Exception as e:
-                    self.log(f'選位區域搜尋錯誤: {e}')
+                    self.log(f'選位區域搜尋錯誤: {e}，{SEAT_POLL_INTERVAL_MS/1000:.1f}秒後重試...')
+                    if self.is_running:
+                        self.after_id = self.log_text.after(SEAT_POLL_INTERVAL_MS, self._handle_seat_selection)
+                    return
             else:
                 # 可能直接進入表單頁（不需選位）
                 is_form_url = "/ticket/ticket/" in current_url
