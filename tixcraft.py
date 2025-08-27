@@ -34,11 +34,16 @@ WAIT_CAPTCHA_IMG = 15        # 驗證碼圖片出現
 WAIT_CAPTCHA_VISIBLE = 10    # 驗證碼圖片可見
 WAIT_CAPTCHA_READY = 5       # 驗證碼 naturalWidth 就緒
 WAIT_CAPTCHA_INPUT = 10      # 驗證碼輸入框可點
-WAIT_POST_SUBMIT = 5         # 提交後狀態變化
+WAIT_POST_SUBMIT = 1         # 提交後狀態變化
 
 # 其他設定
-CAPTCHA_MAX_ATTEMPTS = 5
+CAPTCHA_MAX_ATTEMPTS = 2
 CAPTCHA_LEN = 4
+# 送出驗證碼後允許動作的頁面白名單
+ALLOWED_STAGES_AFTER_CAPTCHA = {'detail', 'game', 'area', 'captcha'}
+# 選區頁自動重整
+REFRESH_ON_AREA = True
+AREA_REFRESH_INTERVAL_MS = 2000
 
 class TixcraftGUI:
     def __init__(self, root):
@@ -84,12 +89,19 @@ class TixcraftGUI:
         self._route_loop_running = False
         # 路由重入保護
         self._routing = False
+        # 選區頁重整時間戳
+        self._last_area_refresh_ts = 0
         
         # 填入之前儲存的值
         self.apply_config()
         
         # 視窗關閉時自動儲存
         root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # 送出驗證碼後的動作限制旗標（預設關閉）
+        self._after_captcha_submitted = False
+        # 懶載入 OCR（避免每次嘗試都新建）
+        self._ocr = None
 
     def load_config(self):
         """載入設定檔"""
@@ -163,8 +175,9 @@ class TixcraftGUI:
         if not self.is_running:
             self.is_running = True
             self.start_btn.config(text="暫停搶票")
+            # 開始前重置驗證碼送出狀態
+            self._after_captcha_submitted = False
             self.start_ticketing()
-            # 啟動持續路由心跳
             self._start_route_loop()
         else:
             self.is_running = False
@@ -218,7 +231,7 @@ class TixcraftGUI:
             current_url = self.driver.current_url
         except Exception as e:
             self.log(f"取得目前URL失敗: {e}")
-            # 繼續輪詢（0.2秒）
+            # 繼續輪詢（0.1秒）
             if self.is_running:
                 self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._wait_for_target_url)
             return
@@ -254,18 +267,26 @@ class TixcraftGUI:
                     if "/activity/game/" in current_url:
                         self.log("已進入目標頁面（符合監控網址），開始自動搶票流程！")
                         self._auto_ticketing()
-                        # 新增：啟動持續路由輪詢，之後回到活動頁也會自動續跑
                         if self.is_running:
                             self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
                         return
+                    elif "/ticket/area/" in current_url or "/ticket/ticket/" in current_url:
+                        self.log("已在選位/表單頁，交由路由處理")
+                        if self.is_running:
+                            self.after_id = self.log_text.after(0, self._route_by_page)
+                        return
             else:
-                # 未設定 monitor_url 則維持原先行為：只要進入 game 頁就啟动
+                # 未設定 monitor_url 也要處理 area/form
                 if "/activity/game/" in current_url:
                     self.log("已進入目標頁面，開始自動搶票流程！")
                     self._auto_ticketing()
-                    # 新增：啟動持續路由輪詢
                     if self.is_running:
                         self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+                    return
+                elif "/ticket/area/" in current_url or "/ticket/ticket/" in current_url:
+                    self.log("偵測到選位/表單頁，交由路由處理")
+                    if self.is_running:
+                        self.after_id = self.log_text.after(0, self._route_by_page)
                     return
 
         # 繼續輪詢（每0.1秒檢查一次）
@@ -360,21 +381,99 @@ class TixcraftGUI:
                     area_list_div = WebDriverWait(self.driver, WAIT_AREA_LIST).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, 'div.zone.area-list'))
                     )
-                    a_tags = area_list_div.find_elements(By.TAG_NAME, 'a')
-                    self.log(f'找到 {len(a_tags)} 個可購買座位區域')
-                    
-                    if a_tags:
-                        # 點擊第一個找到的<a>標籤
-                        first_a = a_tags[0]
-                        area_text = first_a.text or first_a.get_attribute('title') or '未知區域'
-                        self.log(f'點擊座位區域: {area_text}')
-                        self.driver.execute_script("arguments[0].click();", first_a)
+                    # 只抓座位清單 li.select_form_* 底下的 <a>，排除 disabled/sold
+                    a_tags = area_list_div.find_elements(
+                        By.XPATH,
+                        ".//li[starts-with(@class,'select_form_')]/a[@id and "
+                        "not(contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'disabled')) and "
+                        "not(contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'sold'))]"
+                    )
+                    self.log(f'精準抓取到 {len(a_tags)} 個座位區域連結')
+
+                    import re
+                    KEYWORDS_SOLD = ('已售完', '售完', '完售')
+                    KEYWORDS_HOT  = ('熱賣中', '熱賣', '售賣中', 'HOT')
+
+                    # 使用者輸入的張數 n
+                    try:
+                        n = int(self.ticket_count_entry.get().strip() or '1')
+                    except Exception:
+                        n = 1
+
+                    def parse_status(a_el):
+                        """
+                        回傳 (remain, sold_out, is_hot)
+                        - remain: 解析到的數字；找不到回 None（依需求視為可通過）
+                        - sold_out: 文案含「售完/完售」
+                        - is_hot: 文案含「熱賣中/Hot」
+                        """
+                        texts = []
+                        try:
+                            for f in a_el.find_elements(By.TAG_NAME, 'font'):
+                                t = (f.text or '').strip()
+                                if t:
+                                    texts.append(t)
+                        except Exception:
+                            pass
+                        whole = (a_el.text or a_el.get_attribute('innerText') or a_el.get_attribute('title') or '').strip()
+                        if whole:
+                            texts.append(whole)
+                        all_text = ' '.join(texts)
+                        sold_out = any(k in all_text for k in KEYWORDS_SOLD)
+                        is_hot = any(k.lower() in all_text.lower() for k in KEYWORDS_HOT)
+                        m = re.search(r'剩餘\s*(\d+)', all_text)
+                        remain = int(m.group(1)) if m else None
+                        return remain, sold_out, is_hot
+
+                    # 掃到第一個符合條件就點
+                    selected = None
+                    selected_text = ''
+                    selected_remain = None
+
+                    for a in a_tags:
+                        try:
+                            # 顯示且可點的快速檢查
+                            if (not a.is_displayed()) or (not a.is_enabled()):
+                                continue
+                            style = (a.get_attribute('style') or '').lower()
+                            if 'opacity: 0' in style or 'pointer-events: none' in style:
+                                continue
+
+                            remain, sold_out, is_hot = parse_status(a)
+                            if sold_out:
+                                continue
+                            selected_text = (a.text or a.get_attribute('innerText') or a.get_attribute('title') or '').strip()
+                            # 規則：n>1 時 is_hot 或 無數字 或 remain > n；n<=1 時可點即通過
+                            qualifies = (is_hot or (remain is None) or (remain > n)) if n > 1 else True
+                            if qualifies:
+                                selected = a
+                                selected_remain = remain
+                                break
+                        except Exception:
+                            continue
+
+                    if selected:
+                        remain_msg = f'剩餘 {selected_remain}' if selected_remain is not None else '剩餘未知'
+                        self.log(f'依 n={n} 篩選，點擊: {selected_text}（{remain_msg}）')
+                        self.driver.execute_script("arguments[0].click();", selected)
                         self.log('座位區域選擇完成')
-                        
-                        # 直接等待確認按鈕出現並處理
                         self._confirm_selection()
+                        return
                     else:
-                        self.log(f'沒有找到可購買的座位區域，{SEAT_POLL_INTERVAL_MS/1000:.1f}秒後重試掃描...')
+                        # 沒有符合 n 的區域：依設定重整或重掃
+                        if REFRESH_ON_AREA:
+                            now = time.monotonic()
+                            last = getattr(self, '_last_area_refresh_ts', 0)
+                            if now - last >= AREA_REFRESH_INTERVAL_MS / 1000.0:
+                                self._last_area_refresh_ts = now
+                                self.log(f'沒有符合 n={n} 的座位區域，重整選區頁...')
+                                try:
+                                    self.driver.refresh()
+                                    self.last_url = self.driver.current_url
+                                except Exception as e:
+                                    self.log(f'重整失敗: {e}')
+                                return
+                        self.log(f'沒有符合 n={n} 的座位區域，{SEAT_POLL_INTERVAL_MS/1000:.1f}秒後重試掃描...')
                         if self.is_running:
                             self.after_id = self.log_text.after(SEAT_POLL_INTERVAL_MS, self._handle_seat_selection)
                         return
@@ -401,6 +500,11 @@ class TixcraftGUI:
                 if is_form_url or has_form_signals:
                     self.log('偵測到直接進入購票表單頁，跳過選位流程。')
                     self._handle_ticket_form()
+                elif "/activity/game/" in current_url:
+                    self.log('偵測到返回活動頁（game），交由路由處理')
+                    if self.is_running:
+                        self.after_id = self.log_text.after(0, self._route_by_page)
+                    return
                 else:
                     # 還沒跳轉，重新檢查
                     self.log(f'尚未跳轉到選位或表單頁面，{POLL_INTERVAL_MS/1000:.1f}秒後重試...')
@@ -413,6 +517,19 @@ class TixcraftGUI:
         if not self.is_running:
             return
         try:
+            # 頁面守衛：若已不在選位確認頁，交回路由
+            cur = self.driver.current_url
+            if '/activity/game/' in cur:
+                self.log('已返回活動頁（game），交由路由續跑')
+                if self.is_running:
+                    self.after_id = self.log_text.after(0, self._route_by_page)
+                return
+            if '/ticket/ticket/' in cur:
+                self.log('已進入表單頁（form），交由路由續跑')
+                if self.is_running:
+                    self.after_id = self.log_text.after(0, self._route_by_page)
+                return
+
             self.log('等待確認按鈕載入...')
             
             # 等待確認按鈕出現
@@ -442,8 +559,17 @@ class TixcraftGUI:
                 
         except Exception as e:
             self.log(f'確認選位錯誤: {e}，{POLL_INTERVAL_MS/1000:.1f}秒後重試...')
-            # 重試
-            self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._confirm_selection)
+            # 若頁面已轉換，交回路由；否則稍後再嘗試
+            cur = ''
+            try:
+                cur = self.driver.current_url
+            except Exception:
+                pass
+            if ('/activity/game/' in cur) or ('/ticket/ticket/' in cur):
+                if self.is_running:
+                    self.after_id = self.log_text.after(0, self._route_by_page)
+            else:
+                self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._confirm_selection)
 
     def _handle_ticket_form(self):
         # 處理購票資料填寫頁面 - 等待表單元素載入完成後立即處理
@@ -461,6 +587,12 @@ class TixcraftGUI:
             )
             
             current_url = self.driver.current_url
+            # 頁面守衛：嚴格要求在 /ticket/ticket/ 才繼續，否則交回路由
+            if '/ticket/ticket/' not in current_url:
+                self.log(f'偵測到不在表單頁（當前URL: {current_url}），交由路由處理')
+                if self.is_running:
+                    self.after_id = self.log_text.after(0, self._route_by_page)
+                return
             self.log(f'購票資料頁面URL: {current_url}')
             self.log('購票表單已載入完成，開始處理購票資料填寫...')
             
@@ -665,9 +797,10 @@ class TixcraftGUI:
                 # OCR
                 try:
                     import ddddocr
-                    ocr = ddddocr.DdddOcr()
+                    if self._ocr is None:
+                        self._ocr = ddddocr.DdddOcr()
                     img_bytes = base64.b64decode(img_base64)
-                    raw_text = (ocr.classification(img_bytes) or '').strip()
+                    raw_text = (self._ocr.classification(img_bytes) or '').strip()
                     captcha_text = self._normalize_captcha(raw_text)
                     self.log(f'驗證碼識別結果: 原始="{raw_text}", 輸入="{captcha_text}"')
                 except ImportError:
@@ -689,7 +822,8 @@ class TixcraftGUI:
                     captcha_input.clear()
                     captcha_input.send_keys(captcha_text)
                     self.log('驗證碼已填入，立即提交...')
-
+                    # 送出後啟用白名單限制：只在 detail/game/area/captcha 才動作
+                    self._after_captcha_submitted = True
                     self._submit_form()
 
                     # 等待提交後有狀態變化
@@ -827,36 +961,25 @@ class TixcraftGUI:
                 self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
 
     def _current_stage(self) -> str:
-        """回傳目前頁面階段: game/area/form/confirm/detail/unknown"""
+        """回傳目前頁面階段: detail/game/area/captcha/form/unknown（URL 優先）"""
         try:
             url = self.driver.current_url
         except Exception:
             return 'unknown'
-        try:
-            # detail: 活動資訊頁（需轉導到 game）
-            if '/activity/detail/' in url:
-                return 'detail'
-            # game: 活動場次列表
-            if '/activity/game/' in url:
-                return 'game'
-            # area: 區域選位
-            if '/ticket/area/' in url or self.driver.find_elements(By.CSS_SELECTOR, 'div.zone.area-list'):
-                return 'area'
-            # form: 張數/勾選/驗證碼
-            if '/ticket/ticket/' in url:
-                has_form = (
-                    self.driver.find_elements(By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]') or
-                    self.driver.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]') or
-                    self.driver.find_elements(By.CSS_SELECTOR, 'img[id*="captcha"], img[class*="captcha"], img[src*="verify"], img[alt*="驗證"]') or
-                    self.driver.find_elements(By.CSS_SELECTOR, 'input[name*="verify"], input[id*="verify"], input[placeholder*="驗證"]')
-                )
-                if has_form:
-                    return 'form'
-            # confirm: 確認/下一步按鈕
-            if self.driver.find_elements(By.CSS_SELECTOR, 'button[onclick*="confirm"], input[type="submit"][value*="確認"], input[type="button"][value*="確認"], button.btn.btn-primary'):
-                return 'confirm'
-        except Exception:
-            pass
+        if '/activity/detail/' in url:
+            return 'detail'
+        if '/activity/game/' in url:
+            return 'game'
+        if '/ticket/area/' in url:
+            return 'area'
+        if '/ticket/ticket/' in url:
+            # 區分是否為驗證碼頁
+            try:
+                if self._on_captcha_form():
+                    return 'captcha'
+            except Exception:
+                pass
+            return 'form'
         return 'unknown'
 
     def _start_route_loop(self):
@@ -893,7 +1016,6 @@ class TixcraftGUI:
         """依目前頁面自動導向下一步，持續輪詢"""
         if not self.is_running:
             return
-        # 重入保護：避免同時間多條路徑重複進入路由
         if getattr(self, '_routing', False):
             return
         self._routing = True
@@ -904,11 +1026,25 @@ class TixcraftGUI:
                 self.log(f'路由: {prev or "None"} -> {stage}')
                 self._last_stage = stage
 
+            # 若剛送出驗證碼，只有在白名單頁面才允許動作；其他頁面僅監控
+            if getattr(self, '_after_captcha_submitted', False) and stage not in ALLOWED_STAGES_AFTER_CAPTCHA:
+                self.log(f'驗證碼已送出，非白名單頁面（{stage}），暫不動作')
+                # 取消非路由任務避免誤動作
+                if getattr(self, 'after_id', None):
+                    try:
+                        self.log_text.after_cancel(self.after_id)
+                    except Exception:
+                        pass
+                    self.after_id = None
+                if self.is_running:
+                    self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+                return
+            
             if stage == 'detail':
                 # 自動轉導 detail -> game
                 try:
                     url = self.driver.current_url
-                    game_url = url.replace('/detail/', '/game/')
+                    game_url = url.replace('/activity/detail/', '/activity/game/')
                     self.log(f'偵測到 detail 頁，導向 {game_url}')
                     self.driver.get(game_url)
                     self.last_url = self.driver.current_url
@@ -921,10 +1057,12 @@ class TixcraftGUI:
             if stage == 'area':
                 self._handle_seat_selection()
                 return
-            if stage == 'confirm':
-                self._confirm_selection()
+            if stage == 'captcha':
+                # 回到驗證碼頁可繼續處理
+                self._handle_ticket_form()
                 return
             if stage == 'form':
+                # 非驗證碼的表單頁（若需要也可處理，否則僅監控）
                 self._handle_ticket_form()
                 return
             # unknown: 繼續輪詢
