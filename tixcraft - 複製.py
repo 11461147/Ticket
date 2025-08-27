@@ -14,10 +14,13 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # === 等待設定（集中管理） ===
 # GUI 輪詢間隔（ms）
-POLL_INTERVAL_MS = 200
+POLL_INTERVAL_MS = 100
+
+# 選區頁輪詢間隔（ms），在沒有空位時以更快頻率重試
+SEAT_POLL_INTERVAL_MS = 100
 
 # 短暫 sleep（秒），用於非動態等待的最小延遲
-SLEEP_SHORT_SEC = 0.2
+SLEEP_SHORT_SEC = 0.1
 
 # WebDriverWait 超時（秒）
 WAIT_LIST_ROWS = 10          # 場次列表載入
@@ -233,7 +236,7 @@ class TixcraftGUI:
                     self._auto_ticketing()
                     return
 
-        # 繼續輪詢（每0.2秒檢查一次）
+        # 繼續輪詢（每0.1秒檢查一次）
         if self.is_running:
             self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._wait_for_target_url)
 
@@ -333,10 +336,16 @@ class TixcraftGUI:
                         # 直接等待確認按鈕出現並處理
                         self._confirm_selection()
                     else:
-                        self.log('沒有找到可購買的座位區域')
+                        self.log(f'沒有找到可購買的座位區域，{SEAT_POLL_INTERVAL_MS/1000:.1f}秒後重試掃描...')
+                        if self.is_running:
+                            self.after_id = self.log_text.after(SEAT_POLL_INTERVAL_MS, self._handle_seat_selection)
+                        return
                         
                 except Exception as e:
-                    self.log(f'選位區域搜尋錯誤: {e}')
+                    self.log(f'選位區域搜尋錯誤: {e}，{SEAT_POLL_INTERVAL_MS/1000:.1f}秒後重試...')
+                    if self.is_running:
+                        self.after_id = self.log_text.after(SEAT_POLL_INTERVAL_MS, self._handle_seat_selection)
+                    return
             else:
                 # 可能直接進入表單頁（不需選位）
                 is_form_url = "/ticket/ticket/" in current_url
@@ -507,9 +516,15 @@ class TixcraftGUI:
                 
             except Exception as e:
                 self.log(f'等待驗證碼圖片失敗: {e}')
-                # 如果找不到驗證碼圖片，重試一次
-                self.log(f'{POLL_INTERVAL_MS/1000:.1f}秒後重試尋找驗證碼...')
-                self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._handle_captcha)
+                # 如果找不到驗證碼圖片，立即重試（避免等待）
+                self.log('立即重試尋找驗證碼...')
+                if getattr(self, 'after_id', None):
+                    try:
+                        self.log_text.after_cancel(self.after_id)
+                    except Exception:
+                        pass
+                    self.after_id = None
+                self.after_id = self.log_text.after(0, self._handle_captcha)
                 return
             
             # 截取驗證碼圖片
@@ -560,8 +575,7 @@ class TixcraftGUI:
 
                 # 若無法得到任何字元，則先等一下再重試
                 if not captcha_text:
-                    self.log(f'未取得可用驗證碼字元，等待{SLEEP_SHORT_SEC}秒後重試')
-                    time.sleep(SLEEP_SHORT_SEC)
+                    self.log('未取得可用驗證碼字元，立即重試')
                     continue
 
                 # 等待驗證碼輸入框載入並填入
@@ -606,7 +620,7 @@ class TixcraftGUI:
                             self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
                         return
                     else:
-                        self.log('驗證碼錯誤，嘗試重新識別並提交')
+                        self.log('驗證碼錯誤，立即重試')
                         # 若驗證失敗，嘗試回到選張頁（若有需要）重新選擇張數與checkbox
                         try:
                             # 若存在張數下拉或checkbox，重新建立選項（有些站點會要求重新選張）
@@ -632,8 +646,7 @@ class TixcraftGUI:
                         except Exception as e:
                             self.log(f'重新選張/勾選失敗: {e}')
 
-                        # 等待短暫時間後繼續下一輪重試
-                        time.sleep(SLEEP_SHORT_SEC)
+                        # 立即進入下一輪重試
                         continue
 
                 except Exception as e:

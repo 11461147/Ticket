@@ -14,13 +14,13 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # === 等待設定（集中管理） ===
 # GUI 輪詢間隔（ms）
-POLL_INTERVAL_MS = 200
+POLL_INTERVAL_MS = 100
 
 # 選區頁輪詢間隔（ms），在沒有空位時以更快頻率重試
 SEAT_POLL_INTERVAL_MS = 100
 
 # 短暫 sleep（秒），用於非動態等待的最小延遲
-SLEEP_SHORT_SEC = 0.2
+SLEEP_SHORT_SEC = 0.1
 
 # WebDriverWait 超時（秒）
 WAIT_LIST_ROWS = 10          # 場次列表載入
@@ -79,6 +79,11 @@ class TixcraftGUI:
         self.is_running = False
         self.start_btn = tk.Button(root, text="開始搶票", command=self.toggle_ticketing)
         self.start_btn.pack(padx=10, pady=10)
+        # 路由心跳排程控制
+        self._route_timer = None
+        self._route_loop_running = False
+        # 路由重入保護
+        self._routing = False
         
         # 填入之前儲存的值
         self.apply_config()
@@ -133,10 +138,25 @@ class TixcraftGUI:
     def on_closing(self):
         """視窗關閉時的處理"""
         self.save_config()
+        # 結束前停止路由心跳以清理 after
+        self._stop_route_loop()
         self.root.destroy()
 
     def log_message(self, message):
         """用於內部LOG（避免在初始化時調用log方法）"""
+        print(message)
+
+    def log(self, message: str):
+        """寫入 GUI 的 LOG 區塊，同時印到主控台"""
+        try:
+            ts = time.strftime("%H:%M:%S")
+            line = f"[{ts}] {message}\n"
+            self.log_text.configure(state='normal')
+            self.log_text.insert('end', line)
+            self.log_text.see('end')
+            self.log_text.configure(state='disabled')
+        except Exception:
+            pass
         print(message)
 
     def toggle_ticketing(self):
@@ -144,10 +164,14 @@ class TixcraftGUI:
             self.is_running = True
             self.start_btn.config(text="暫停搶票")
             self.start_ticketing()
+            # 啟動持續路由心跳
+            self._start_route_loop()
         else:
             self.is_running = False
             self.start_btn.config(text="開始搶票")
             self.log("已暫停搶票。")
+            self._stop_route_loop()
+
     def start_ticketing(self):
         # 啟動 Selenium ChromeDriver，只開首頁，等待用戶手動進入指定網址
         from selenium.webdriver.support import expected_conditions as EC
@@ -180,6 +204,8 @@ class TixcraftGUI:
             self.last_url = self.driver.current_url
             self.after_id = None
             self._wait_for_target_url()
+            # 確保路由心跳已啟動
+            self._start_route_loop()
         except Exception as e:
             self.log(f"ChromeDriver 啟動失敗: {e}")
 
@@ -228,15 +254,21 @@ class TixcraftGUI:
                     if "/activity/game/" in current_url:
                         self.log("已進入目標頁面（符合監控網址），開始自動搶票流程！")
                         self._auto_ticketing()
+                        # 新增：啟動持續路由輪詢，之後回到活動頁也會自動續跑
+                        if self.is_running:
+                            self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
                         return
             else:
-                # 未設定 monitor_url 則維持原先行為：只要進入 game 頁就啟動
+                # 未設定 monitor_url 則維持原先行為：只要進入 game 頁就啟动
                 if "/activity/game/" in current_url:
                     self.log("已進入目標頁面，開始自動搶票流程！")
                     self._auto_ticketing()
+                    # 新增：啟動持續路由輪詢
+                    if self.is_running:
+                        self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
                     return
 
-        # 繼續輪詢（每0.2秒檢查一次）
+        # 繼續輪詢（每0.1秒檢查一次）
         if self.is_running:
             self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._wait_for_target_url)
 
@@ -282,8 +314,14 @@ class TixcraftGUI:
                     self.log(f'場次 {i+1} 找不到按鈕: {e}')
             if not found:
                 self.log('未找到可購票按鈕，可能已售完、尚未開放或關鍵字不符。')
+                # 新增：回到路由輪詢，之後頁面變化會再自動觸發
+                if self.is_running:
+                    self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
         except Exception as e:
             self.log(f'自動搶票流程錯誤: {e}')
+            # 新增：即使錯誤也回到路由輪詢，避免卡住
+            if self.is_running:
+                self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
 
     def _handle_seat_selection(self):
         # 處理選位頁面的自動化 - 等待頁面載入完成後立即動作
@@ -354,7 +392,8 @@ class TixcraftGUI:
                     has_form_signals = bool(
                         self.driver.find_elements(By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]') or
                         self.driver.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]') or
-                        self.driver.find_elements(By.CSS_SELECTOR, 'img[id*="captcha"], img[class*="captcha"], img[src*="verify"]')
+                        self.driver.find_elements(By.CSS_SELECTOR, 'img[id*="captcha"], img[class*="captcha"], img[src*="verify"]') or
+                        self.driver.find_elements(By.CSS_SELECTOR, 'input[name*="verify"], input[id*="verify"], input[placeholder*="驗證"]')
                     )
                 except Exception:
                     has_form_signals = False
@@ -481,16 +520,68 @@ class TixcraftGUI:
         except Exception as e:
             self.log(f'購票資料頁面處理錯誤: {e}')
 
+    def _normalize_captcha(self, text: str) -> str:
+        """將 OCR 結果標準化為固定 CAPTCHA_LEN 位：
+        - 去首尾空白，保留原始大小寫
+        - 僅保留英數字
+        - 長於 CAPTCHA_LEN 取前 CAPTCHA_LEN 位；短於則以最後一字元重複補齊；若空字串則回傳空
+        """
+        if not text:
+            return ''
+        t = text.strip()
+        norm = []
+        for ch in t:
+            if ch.isalnum():
+                norm.append(ch)
+        if not norm:
+            return ''
+        norm_str = ''.join(norm)
+        if len(norm_str) > CAPTCHA_LEN:
+            return norm_str[:CAPTCHA_LEN]
+        if len(norm_str) < CAPTCHA_LEN:
+            last = norm_str[-1]
+            norm_str = norm_str + last * (CAPTCHA_LEN - len(norm_str))
+        return norm_str
+
+    def _on_captcha_form(self) -> bool:
+        """是否身處需要輸入驗證碼的表單頁。
+        條件：URL 含 /ticket/ticket/ 且有 captcha 圖片或驗證碼輸入框。
+        """
+        try:
+            url = self.driver.current_url
+        except Exception:
+            return False
+        if '/ticket/ticket/' not in url:
+            return False
+        try:
+            has_img = bool(self.driver.find_elements(By.CSS_SELECTOR, 'img[id*="captcha"], img[class*="captcha"], img[src*="verify"], img[alt*="驗證"]'))
+            has_input = bool(self.driver.find_elements(By.CSS_SELECTOR, 'input[name*="verify"], input[id*="verify"], input[placeholder*="驗證"]'))
+            return has_img or has_input
+        except Exception:
+            return False
+
     def _handle_captcha(self):
         # 使用ddddocr處理驗證碼
         if not self.is_running:
             return
         try:
+            # 僅在驗證碼表單頁才進入此流程
+            if not self._on_captcha_form():
+                self.log('目前不在驗證碼表單頁，交由路由處理')
+                if self.is_running:
+                    # 取消舊排程避免堆積
+                    if getattr(self, 'after_id', None):
+                        try:
+                            self.log_text.after_cancel(self.after_id)
+                        except Exception:
+                            pass
+                        self.after_id = None
+                    self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+                return
+
             self.log('開始尋找驗證碼圖片...')
-            
             # 使用更全面的等待策略確保驗證碼圖片完全載入
             try:
-                # 先等待任何驗證碼相關圖片出現
                 captcha_img = WebDriverWait(self.driver, WAIT_CAPTCHA_IMG).until(
                     EC.any_of(
                         EC.presence_of_element_located((By.CSS_SELECTOR, 'img[style*="cursor:pointer"]')),
@@ -501,43 +592,58 @@ class TixcraftGUI:
                     )
                 )
                 self.log(f'找到驗證碼圖片元素: {captcha_img.get_attribute("src") or "無src屬性"}')
-                
-                # 等待圖片完全載入且可見
-                WebDriverWait(self.driver, WAIT_CAPTCHA_VISIBLE).until(
-                    EC.visibility_of(captcha_img)
-                )
+
+                WebDriverWait(self.driver, WAIT_CAPTCHA_VISIBLE).until(EC.visibility_of(captcha_img))
                 self.log('驗證碼圖片已可見')
-                
-                # 額外等待確保圖片內容載入完成
+
                 WebDriverWait(self.driver, WAIT_CAPTCHA_READY).until(
                     lambda driver: captcha_img.get_attribute('naturalWidth') != '0'
                 )
                 self.log('驗證碼圖片載入完成，開始識別...')
-                
             except Exception as e:
                 self.log(f'等待驗證碼圖片失敗: {e}')
-                # 如果找不到驗證碼圖片，重試一次
+                # 若已不在驗證碼表單頁，改交由路由
+                if not self._on_captcha_form():
+                    self.log('偵測到已離開驗證碼表單頁，交由路由續跑')
+                    if self.is_running:
+                        if getattr(self, 'after_id', None):
+                            try:
+                                self.log_text.after_cancel(self.after_id)
+                            except Exception:
+                                pass
+                        self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+                    return
+                # 仍在表單但尚無圖，稍後再找，避免忙迴圈
                 self.log(f'{POLL_INTERVAL_MS/1000:.1f}秒後重試尋找驗證碼...')
-                self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._handle_captcha)
+                if self.is_running:
+                    self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._handle_captcha)
                 return
-            
+
             # 截取驗證碼圖片
             import base64
-            import io
-            from PIL import Image
-            
-            # 初始化重試計數
+            from PIL import Image  # noqa: F401 只為保留依賴
+
             if not hasattr(self, '_captcha_attempts'):
                 self._captcha_attempts = 0
             max_attempts = CAPTCHA_MAX_ATTEMPTS
 
             while self.is_running and self._captcha_attempts < max_attempts:
+                # 每輪先確認還在驗證碼表單頁
+                if not self._on_captcha_form():
+                    self.log('已離開驗證碼表單頁，交由路由處理')
+                    if self.is_running:
+                        self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+                    return
+
                 self._captcha_attempts += 1
                 self.log(f'驗證碼嘗試 {self._captcha_attempts}/{max_attempts}')
 
-                # 獲取圖片的base64數據（重新取得最新的元素以避免 stale）
+                # 重新取得圖片元素並擷取
                 try:
-                    captcha_img = self.driver.find_element(By.CSS_SELECTOR, 'img[id*="captcha"], img[class*="captcha"], img[src*="verify"], img[alt*="驗證"], img[style*="cursor:pointer"]')
+                    captcha_img = self.driver.find_element(
+                        By.CSS_SELECTOR,
+                        'img[id*="captcha"], img[class*="captcha"], img[src*="verify"], img[alt*="驗證"], img[style*="cursor:pointer"]'
+                    )
                     img_base64 = self.driver.execute_script("""
                         var canvas = document.createElement('canvas');
                         var ctx = canvas.getContext('2d');
@@ -549,15 +655,19 @@ class TixcraftGUI:
                     """, captcha_img)
                 except Exception as e:
                     self.log(f'擷取驗證碼圖片失敗: {e}')
-                    break
+                    if not self._on_captcha_form():
+                        self.log('偵測到已離開驗證碼表單頁，交由路由續跑')
+                        if self.is_running:
+                            self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+                        return
+                    continue
 
-                # 使用ddddocr識別
+                # OCR
                 try:
                     import ddddocr
                     ocr = ddddocr.DdddOcr()
                     img_bytes = base64.b64decode(img_base64)
-                    raw_text = ocr.classification(img_bytes)
-                    raw_text = (raw_text or '').strip()
+                    raw_text = (ocr.classification(img_bytes) or '').strip()
                     captcha_text = self._normalize_captcha(raw_text)
                     self.log(f'驗證碼識別結果: 原始="{raw_text}", 輸入="{captcha_text}"')
                 except ImportError:
@@ -567,13 +677,11 @@ class TixcraftGUI:
                     self.log(f'驗證碼識別錯誤: {e}')
                     captcha_text = ''
 
-                # 若無法得到任何字元，則先等一下再重試
                 if not captcha_text:
-                    self.log(f'未取得可用驗證碼字元，等待{SLEEP_SHORT_SEC}秒後重試')
-                    time.sleep(SLEEP_SHORT_SEC)
+                    self.log('未取得可用驗證碼字元，立即重試')
                     continue
 
-                # 等待驗證碼輸入框載入並填入
+                # 填入並提交
                 try:
                     captcha_input = WebDriverWait(self.driver, WAIT_CAPTCHA_INPUT).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[name*="verify"], input[id*="verify"], input[placeholder*="驗證"]'))
@@ -582,9 +690,9 @@ class TixcraftGUI:
                     captcha_input.send_keys(captcha_text)
                     self.log('驗證碼已填入，立即提交...')
 
-                    # 驗證碼填入後立即提交
-                    submitted = self._submit_form()
-                    # 檢查提交後是否仍在驗證碼頁或出現錯誤訊息
+                    self._submit_form()
+
+                    # 等待提交後有狀態變化
                     try:
                         WebDriverWait(self.driver, WAIT_POST_SUBMIT).until(
                             EC.any_of(
@@ -597,7 +705,15 @@ class TixcraftGUI:
                     except Exception:
                         pass
 
-                    # 聚合失敗條件：仍看到驗證碼圖、驗證碼輸入框，或錯誤訊息包含「驗證/錯誤」等
+                    # 若提交後已不在驗證碼表單頁，交回路由
+                    if not self._on_captcha_form():
+                        self.log('提交後已離開驗證碼頁，交由路由處理')
+                        self._captcha_attempts = 0
+                        if self.is_running:
+                            self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+                        return
+
+                    # 聚合失敗條件
                     try:
                         has_img = bool(self.driver.find_elements(By.CSS_SELECTOR, 'img[id*="captcha"], img[class*="captcha"], img[src*="verify"]'))
                         has_input = bool(self.driver.find_elements(By.CSS_SELECTOR, 'input[name*="verify"], input[id*="verify"], input[placeholder*="驗證"]'))
@@ -609,16 +725,14 @@ class TixcraftGUI:
 
                     if not failed_captcha:
                         self.log('驗證通過，繼續下一步')
-                        # 重設嘗試計數並依頁面狀態續跑
                         self._captcha_attempts = 0
                         if self.is_running:
                             self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
                         return
                     else:
-                        self.log('驗證碼錯誤，嘗試重新識別並提交')
-                        # 若驗證失敗，嘗試回到選張頁（若有需要）重新選擇張數與checkbox
+                        self.log('驗證碼錯誤，立即重試')
+                        # 重新選張/勾選（若需要）
                         try:
-                            # 若存在張數下拉或checkbox，重新建立選項（有些站點會要求重新選張）
                             selects = self.driver.find_elements(By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]')
                             for select in selects:
                                 try:
@@ -637,27 +751,27 @@ class TixcraftGUI:
                                         self.driver.execute_script("arguments[0].click();", checkbox)
                                 except Exception:
                                     continue
-                            # 不主動點擊驗證碼刷新，等待站方自動更新
                         except Exception as e:
                             self.log(f'重新選張/勾選失敗: {e}')
-
-                        # 等待短暫時間後繼續下一輪重試
-                        time.sleep(SLEEP_SHORT_SEC)
                         continue
 
                 except Exception as e:
                     self.log(f'驗證碼輸入框處理錯誤: {e}')
-                    break
+                    if not self._on_captcha_form():
+                        self.log('偵測到已離開驗證碼表單頁，交由路由續跑')
+                        if self.is_running:
+                            self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+                        return
+                    continue
 
             # 超出重試次數仍失敗
             if getattr(self, '_captcha_attempts', 0) >= max_attempts:
                 self.log(f'驗證碼嘗試達到上限 ({max_attempts})，改為依頁面狀態自動導向續跑')
                 self._captcha_attempts = 0
-                # 依照當前頁面自動導向對應流程，避免整體停住
                 if self.is_running:
                     self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
                 return
-            
+
         except Exception as e:
             self.log(f'驗證碼處理錯誤: {e}')
 
@@ -700,118 +814,126 @@ class TixcraftGUI:
             if submit_btn:
                 self.driver.execute_script("arguments[0].click();", submit_btn)
                 self.log('已點擊提交/確認按鈕，等待下一步...')
+                # 新增：提交後啟動路由輪詢以因應頁面變化（成功、失敗或返回）
+                if self.is_running:
+                    self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
             else:
                 self.log('未找到提交按鈕')
             
         except Exception as e:
             self.log(f'表單提交錯誤: {e}')
-
-    def _normalize_captcha(self, text: str) -> str:
-        """將 OCR 結果標準化為固定 CAPTCHA_LEN 位：
-        - 去首尾空白，保留原始大小寫
-        - 僅保留英數字
-        - 長於 CAPTCHA_LEN 取前 CAPTCHA_LEN 位；短於則以最後一字元重複補齊；若空字串則回傳空
-        """
-        if not text:
-            return ''
-        t = text.strip()
-        norm = []
-        for ch in t:
-            if ch.isalnum():
-                norm.append(ch)
-        if not norm:
-            return ''
-        norm_str = ''.join(norm)
-        if len(norm_str) > CAPTCHA_LEN:
-            return norm_str[:CAPTCHA_LEN]
-        if len(norm_str) < CAPTCHA_LEN:
-            last = norm_str[-1]
-            norm_str = norm_str + last * (CAPTCHA_LEN - len(norm_str))
-        return norm_str
+            # 新增：錯誤也回到路由輪詢
+            if self.is_running:
+                self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
 
     def _current_stage(self) -> str:
-        """根據 URL 與頁面元素判斷目前流程階段。
-        回傳: 'game' | 'area' | 'confirm' | 'form' | 'unknown'
-        """
+        """回傳目前頁面階段: game/area/form/confirm/detail/unknown"""
         try:
             url = self.driver.current_url
         except Exception:
             return 'unknown'
-
-        # game 列表頁（場次）
         try:
+            # detail: 活動資訊頁（需轉導到 game）
+            if '/activity/detail/' in url:
+                return 'detail'
+            # game: 活動場次列表
             if '/activity/game/' in url:
-                rows = self.driver.find_elements(By.CSS_SELECTOR, 'tr.gridc.fcTxt')
-                if rows:
-                    return 'game'
-        except Exception:
-            pass
-
-        # 選位區域頁
-        try:
+                return 'game'
+            # area: 區域選位
             if '/ticket/area/' in url or self.driver.find_elements(By.CSS_SELECTOR, 'div.zone.area-list'):
                 return 'area'
-        except Exception:
-            pass
-
-        # 確認選位頁（有確認按鈕）
-        try:
-            if self.driver.find_elements(By.CSS_SELECTOR, 'button[onclick*="confirm"], input[type="submit"][value*="確認"], input[type="button"][value*="確認"], button.btn.btn-primary, a[onclick*="confirm"]'):
+            # form: 張數/勾選/驗證碼
+            if '/ticket/ticket/' in url:
+                has_form = (
+                    self.driver.find_elements(By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]') or
+                    self.driver.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]') or
+                    self.driver.find_elements(By.CSS_SELECTOR, 'img[id*="captcha"], img[class*="captcha"], img[src*="verify"], img[alt*="驗證"]') or
+                    self.driver.find_elements(By.CSS_SELECTOR, 'input[name*="verify"], input[id*="verify"], input[placeholder*="驗證"]')
+                )
+                if has_form:
+                    return 'form'
+            # confirm: 確認/下一步按鈕
+            if self.driver.find_elements(By.CSS_SELECTOR, 'button[onclick*="confirm"], input[type="submit"][value*="確認"], input[type="button"][value*="確認"], button.btn.btn-primary'):
                 return 'confirm'
         except Exception:
             pass
-
-        # 購票表單頁（含張數/checkbox/驗證碼）
-        try:
-            if ('/ticket/ticket/' in url or
-                self.driver.find_elements(By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]') or
-                self.driver.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]') or
-                self.driver.find_elements(By.CSS_SELECTOR, 'img[id*="captcha"], img[class*="captcha"], img[src*="verify"]')):
-                return 'form'
-        except Exception:
-            pass
-
         return 'unknown'
 
+    def _start_route_loop(self):
+        """啟動固定頻率的路由心跳，不受其他 after 排程取消影響。"""
+        if self._route_loop_running:
+            return
+        self._route_loop_running = True
+
+        def _tick():
+            if not self.is_running:
+                self._route_loop_running = False
+                return
+            try:
+                self._route_by_page()
+            except Exception as e:
+                self.log(f'路由錯誤: {e}')
+            finally:
+                if self.is_running:
+                    self._route_timer = self.root.after(POLL_INTERVAL_MS, _tick)
+
+        self._route_timer = self.root.after(POLL_INTERVAL_MS, _tick)
+
+    def _stop_route_loop(self):
+        """停止路由心跳。"""
+        if getattr(self, '_route_timer', None):
+            try:
+                self.root.after_cancel(self._route_timer)
+            except Exception:
+                pass
+            self._route_timer = None
+        self._route_loop_running = False
+
     def _route_by_page(self):
-        """依據當前頁面狀態導向對應流程，避免流程中斷。"""
+        """依目前頁面自動導向下一步，持續輪詢"""
         if not self.is_running:
             return
-        # 若設定了 monitor_url，需檢核是否為同一活動（限制在 activity 頁面上才檢核）
-        monitor = getattr(self, 'monitor_url', '').strip()
+        # 重入保護：避免同時間多條路徑重複進入路由
+        if getattr(self, '_routing', False):
+            return
+        self._routing = True
         try:
-            current_url = self.driver.current_url
-        except Exception:
-            current_url = ''
+            stage = self._current_stage()
+            prev = getattr(self, '_last_stage', '')
+            if stage != prev:
+                self.log(f'路由: {prev or "None"} -> {stage}')
+                self._last_stage = stage
 
-        if monitor and ('/activity/game/' in current_url or '/activity/detail/' in current_url):
-            if monitor not in current_url:
-                self.log('目前頁面非監控活動，暫不進入搶票流程。')
-                if self.is_running:
-                    self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+            if stage == 'detail':
+                # 自動轉導 detail -> game
+                try:
+                    url = self.driver.current_url
+                    game_url = url.replace('/detail/', '/game/')
+                    self.log(f'偵測到 detail 頁，導向 {game_url}')
+                    self.driver.get(game_url)
+                    self.last_url = self.driver.current_url
+                except Exception as e:
+                    self.log(f'導向 game 失敗: {e}')
                 return
-
-        stage = self._current_stage()
-        self.log(f'頁面狀態判斷: {stage}')
-        if stage == 'game':
-            self._auto_ticketing()
-        elif stage == 'area':
-            self._handle_seat_selection()
-        elif stage == 'confirm':
-            self._confirm_selection()
-        elif stage == 'form':
-            self._handle_ticket_form()
-        else:
-            # 未知狀態，稍後再判斷
+            if stage == 'game':
+                self._auto_ticketing()
+                return
+            if stage == 'area':
+                self._handle_seat_selection()
+                return
+            if stage == 'confirm':
+                self._confirm_selection()
+                return
+            if stage == 'form':
+                self._handle_ticket_form()
+                return
+            # unknown: 繼續輪詢
             if self.is_running:
                 self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
+        finally:
+            self._routing = False
 
-    def log(self, message):
-        self.log_text.config(state='normal')
-        self.log_text.insert(tk.END, message + '\n')
-        self.log_text.see(tk.END)
-        self.log_text.config(state='disabled')
-
+# 程式入口：建立 GUI 並啟動事件迴圈
 if __name__ == "__main__":
     root = tk.Tk()
     app = TixcraftGUI(root)
