@@ -345,172 +345,60 @@ class TixcraftGUI:
                 self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
 
     def _handle_seat_selection(self):
-        # 處理選位頁面的自動化 - 等待頁面載入完成後立即動作
+        """純 JS 快速選位（含剩餘數量篩選）"""
         if not self.is_running:
             return
+
         try:
-            # 等待選位頁面完全載入
-            self.log('等待選位頁面載入...')
-            WebDriverWait(self.driver, WAIT_AREA_PAGE).until(
-                EC.any_of(
-                    # 選位頁訊號
-                    EC.url_contains("/ticket/area/"),
-                    EC.presence_of_element_located((By.CSS_SELECTOR, 'div.zone.area-list')),
-                    # 有些活動不需選位，會直接進表單頁
-                    EC.url_contains("/ticket/ticket/"),
-                    EC.presence_of_element_located((By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"], input[type="checkbox"], img[id*="captcha"], img[class*="captcha"], img[src*="verify"]'))
-                )
-            )
-            
-            current_url = self.driver.current_url
-            self.log(f'選位頁面URL: {current_url}')
-            
-            # 檢查是否在選位頁面（包含area字樣）
-            in_area_url = "/ticket/area/" in current_url
-            has_area_list = False
-            try:
-                has_area_list = bool(self.driver.find_elements(By.CSS_SELECTOR, 'div.zone.area-list'))
-            except Exception:
-                has_area_list = False
+            n = int(self.ticket_count_entry.get().strip() or '1')
+        except:
+            n = 1
 
-            if in_area_url or has_area_list:
-                self.log('已進入選位頁面，開始自動選位...')
+        # JS 判斷 + 點擊，包含剩餘數量檢查
+        js_code = """
+        (function(n) {
+            const container = document.querySelector('div.zone.area-list');
+            if (!container) return {found: false, reason: 'no_container'};
+            
+            const links = container.querySelectorAll('li[class^="select_form_"] > a[id]');
+            if (!links.length) return {found: false, reason: 'no_links', count: 0};
+            
+            for (const a of links) {
+                // 可見性檢查
+                if (!a.offsetParent) continue;
+                const cs = getComputedStyle(a);
+                if (cs.pointerEvents === 'none') continue;
+                if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+                if (a.classList.contains('disabled') || a.classList.contains('sold')) continue;
                 
-                # 等待選位區域元素載入
-                try:
-                    area_list_div = WebDriverWait(self.driver, WAIT_AREA_LIST).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, 'div.zone.area-list'))
-                    )
-                    # 只抓座位清單 li.select_form_* 底下的 <a>，排除 disabled/sold
-                    a_tags = area_list_div.find_elements(
-                        By.XPATH,
-                        ".//li[starts-with(@class,'select_form_')]/a[@id and "
-                        "not(contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'disabled')) and "
-                        "not(contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'sold'))]"
-                    )
-                    self.log(f'精準抓取到 {len(a_tags)} 個座位區域連結')
-
-                    import re
-                    KEYWORDS_SOLD = ('已售完', '售完', '完售')
-                    KEYWORDS_HOT  = ('熱賣中', '熱賣', '售賣中', 'HOT')
-
-                    # 使用者輸入的張數 n
-                    try:
-                        n = int(self.ticket_count_entry.get().strip() or '1')
-                    except Exception:
-                        n = 1
-
-                    def parse_status(a_el):
-                        """
-                        回傳 (remain, sold_out, is_hot)
-                        - remain: 解析到的數字；找不到回 None（依需求視為可通過）
-                        - sold_out: 文案含「售完/完售」
-                        - is_hot: 文案含「熱賣中/Hot」
-                        """
-                        texts = []
-                        try:
-                            for f in a_el.find_elements(By.TAG_NAME, 'font'):
-                                t = (f.text or '').strip()
-                                if t:
-                                    texts.append(t)
-                        except Exception:
-                            pass
-                        whole = (a_el.text or a_el.get_attribute('innerText') or a_el.get_attribute('title') or '').strip()
-                        if whole:
-                            texts.append(whole)
-                        all_text = ' '.join(texts)
-                        sold_out = any(k in all_text for k in KEYWORDS_SOLD)
-                        is_hot = any(k.lower() in all_text.lower() for k in KEYWORDS_HOT)
-                        m = re.search(r'剩餘\s*(\d+)', all_text)
-                        remain = int(m.group(1)) if m else None
-                        return remain, sold_out, is_hot
-
-                    # 掃到第一個符合條件就點
-                    selected = None
-                    selected_text = ''
-                    selected_remain = None
-
-                    for a in a_tags:
-                        try:
-                            # 顯示且可點的快速檢查
-                            if (not a.is_displayed()) or (not a.is_enabled()):
-                                continue
-                            style = (a.get_attribute('style') or '').lower()
-                            if 'opacity: 0' in style or 'pointer-events: none' in style:
-                                continue
-
-                            remain, sold_out, is_hot = parse_status(a)
-                            if sold_out:
-                                continue
-                            selected_text = (a.text or a.get_attribute('innerText') or a.get_attribute('title') or '').strip()
-                            # 規則：n>1 時 is_hot 或 無數字 或 remain > n；n<=1 時可點即通過
-                            qualifies = (is_hot or (remain is None) or (remain > n)) if n > 1 else True
-                            if qualifies:
-                                selected = a
-                                selected_remain = remain
-                                break
-                        except Exception:
-                            continue
-
-                    if selected:
-                        remain_msg = f'剩餘 {selected_remain}' if selected_remain is not None else '剩餘未知'
-                        self.log(f'依 n={n} 篩選，點擊: {selected_text}（{remain_msg}）')
-                        self.driver.execute_script("arguments[0].click();", selected)
-                        self.log('座位區域選擇完成')
-                        self._confirm_selection()
-                        return
-                    else:
-                        # 沒有符合 n 的區域：依設定重整或重掃
-                        if REFRESH_ON_AREA:
-                            now = time.monotonic()
-                            last = getattr(self, '_last_area_refresh_ts', 0)
-                            if now - last >= AREA_REFRESH_INTERVAL_MS / 1000.0:
-                                self._last_area_refresh_ts = now
-                                self.log(f'沒有符合 n={n} 的座位區域，重整選區頁...')
-                                try:
-                                    self.driver.refresh()
-                                    self.last_url = self.driver.current_url
-                                except Exception as e:
-                                    self.log(f'重整失敗: {e}')
-                                return
-                        self.log(f'沒有符合 n={n} 的座位區域，{SEAT_POLL_INTERVAL_MS/1000:.1f}秒後重試掃描...')
-                        if self.is_running:
-                            self.after_id = self.log_text.after(SEAT_POLL_INTERVAL_MS, self._handle_seat_selection)
-                        return
-                        
-                except Exception as e:
-                    self.log(f'選位區域搜尋錯誤: {e}，{SEAT_POLL_INTERVAL_MS/1000:.1f}秒後重試...')
-                    if self.is_running:
-                        self.after_id = self.log_text.after(SEAT_POLL_INTERVAL_MS, self._handle_seat_selection)
-                    return
-            else:
-                # 可能直接進入表單頁（不需選位）
-                is_form_url = "/ticket/ticket/" in current_url
-                has_form_signals = False
-                try:
-                    has_form_signals = bool(
-                        self.driver.find_elements(By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]') or
-                        self.driver.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]') or
-                        self.driver.find_elements(By.CSS_SELECTOR, 'img[id*="captcha"], img[class*="captcha"], img[src*="verify"]') or
-                        self.driver.find_elements(By.CSS_SELECTOR, 'input[name*="verify"], input[id*="verify"], input[placeholder*="驗證"]')
-                    )
-                except Exception:
-                    has_form_signals = False
-
-                if is_form_url or has_form_signals:
-                    self.log('偵測到直接進入購票表單頁，跳過選位流程。')
-                    self._handle_ticket_form()
-                elif "/activity/game/" in current_url:
-                    self.log('偵測到返回活動頁（game），交由路由處理')
-                    if self.is_running:
-                        self.after_id = self.log_text.after(0, self._route_by_page)
-                    return
-                else:
-                    # 還沒跳轉，重新檢查
-                    self.log(f'尚未跳轉到選位或表單頁面，{POLL_INTERVAL_MS/1000:.1f}秒後重試...')
-                    self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._handle_seat_selection)
+                // 剩餘數量檢查：若有「剩餘 X」且 X < n，跳過
+                const text = a.innerText || a.textContent || '';
+                const m = text.match(/剩餘\\s*(\\d+)/);
+                if (m && parseInt(m[1]) < n) continue;
+                
+                // 能點就點
+                a.click();
+                return {found: true, text: text.substring(0, 30), remain: m ? parseInt(m[1]) : null};
+            }
+            return {found: false, reason: 'no_match', count: links.length};
+        })(arguments[0]);
+        """
+        
+        try:
+            result = self.driver.execute_script(js_code, n)
         except Exception as e:
-            self.log(f'選位頁面處理錯誤: {e}')
+            self.log(f'JS 選位錯誤: {e}')
+            return
+        
+        if result and result.get('found'):
+            remain = result.get('remain')
+            remain_msg = f"剩餘 {remain}" if remain is not None else "剩餘未知"
+            self.log(f"選位成功: {result.get('text')} ({remain_msg})")
+            self._confirm_selection()
+        else:
+            reason = result.get('reason') if result else 'error'
+            count = result.get('count', 0) if result else 0
+            self.log(f"無符合區域 (n={n}): {reason}, 掃描 {count} 個")
 
     def _confirm_selection(self):
         # 確認選位並進入下一步 - 等待確認按鈕載入後立即點擊
@@ -1055,7 +943,19 @@ class TixcraftGUI:
                 self._auto_ticketing()
                 return
             if stage == 'area':
-                self._handle_seat_selection()
+                # 檢查是否需要重整
+                if REFRESH_ON_AREA:
+                    now = time.monotonic()
+                    if now - getattr(self, '_last_area_refresh_ts', 0) >= AREA_REFRESH_INTERVAL_MS / 1000.0:
+                        # 先嘗試選位
+                        self._handle_seat_selection()
+                        # 如果還在 area 頁（沒選到），就重整
+                        if self._current_stage() == 'area':
+                            self._last_area_refresh_ts = now
+                            self.log('選位失敗，重整頁面...')
+                            self.driver.refresh()
+                else:
+                    self._handle_seat_selection()
                 return
             if stage == 'captcha':
                 # 回到驗證碼頁可繼續處理
@@ -1070,6 +970,7 @@ class TixcraftGUI:
                 self.after_id = self.log_text.after(POLL_INTERVAL_MS, self._route_by_page)
         finally:
             self._routing = False
+
 
 # 程式入口：建立 GUI 並啟動事件迴圈
 if __name__ == "__main__":
