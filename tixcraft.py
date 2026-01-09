@@ -43,7 +43,7 @@ CAPTCHA_LEN = 4
 ALLOWED_STAGES_AFTER_CAPTCHA = {'detail', 'game', 'area', 'captcha'}
 # 選區頁自動重整
 REFRESH_ON_AREA = True
-AREA_REFRESH_INTERVAL_MS = 2000
+AREA_REFRESH_INTERVAL_MS = 1500
 
 class TixcraftGUI:
     def __init__(self, root):
@@ -354,7 +354,7 @@ class TixcraftGUI:
         except:
             n = 1
 
-        # JS 判斷 + 點擊，包含剩餘數量檢查
+        # JS 判斷 + 點擊，包含剩餘數量檢查，跳過身障區
         js_code = """
         (function(n) {
             const container = document.querySelector('div.zone.area-list');
@@ -362,6 +362,9 @@ class TixcraftGUI:
             
             const links = container.querySelectorAll('li[class^="select_form_"] > a[id]');
             if (!links.length) return {found: false, reason: 'no_links', count: 0};
+            
+            // 身障區關鍵字
+            const skipKeywords = ['身障', '輪椅', '身心障礙', '無障礙', 'wheelchair', 'disabled'];
             
             for (const a of links) {
                 // 可見性檢查
@@ -371,8 +374,13 @@ class TixcraftGUI:
                 if (cs.display === 'none' || cs.visibility === 'hidden') continue;
                 if (a.classList.contains('disabled') || a.classList.contains('sold')) continue;
                 
-                // 剩餘數量檢查：若有「剩餘 X」且 X < n，跳過
                 const text = a.innerText || a.textContent || '';
+                
+                // 跳過身障區
+                const lowerText = text.toLowerCase();
+                if (skipKeywords.some(kw => lowerText.includes(kw.toLowerCase()))) continue;
+                
+                // 剩餘數量檢查：若有「剩餘 X」且 X < n，跳過
                 const m = text.match(/剩餘\\s*(\\d+)/);
                 if (m && parseInt(m[1]) < n) continue;
                 
