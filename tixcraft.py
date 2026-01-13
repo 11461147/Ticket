@@ -500,20 +500,48 @@ class TixcraftGUI:
             
             try:
                 # 等待下拉選單載入
-                select_elements = WebDriverWait(self.driver, WAIT_SELECTS).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]'))
+                WebDriverWait(self.driver, WAIT_SELECTS).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]'))
                 )
-                for select in select_elements:
-                    try:
-                        # 尋找對應張數的option
-                        options = select.find_elements(By.TAG_NAME, 'option')
-                        for option in options:
-                            if option.get_attribute('value') == ticket_count:
-                                self.log(f'選擇張數選項: {option.text}')
-                                option.click()
-                                break
-                    except Exception as e:
-                        self.log(f'下拉選單操作錯誤: {e}')
+                # 使用 JS 一次性設定所有下拉選單，比 Selenium 逐一操作快很多
+                # 自動略過輪椅、身障、身心障礙等特殊票種
+                result = self.driver.execute_script("""
+                    var targetValue = arguments[0];
+                    var selects = document.querySelectorAll('select[name*="ticketPrice"], select[id*="ticketPrice"]');
+                    var changed = 0;
+                    var skipped = 0;
+                    // 排除關鍵字（輪椅、身障、身心障礙、陪同、愛心等）
+                    var skipKeywords = ['輪椅', '身障', '身心障礙', '障礙', '陪同', '愛心', '殘障', 'wheelchair', 'disabled'];
+                    
+                    selects.forEach(function(sel) {
+                        // 取得該選單的相關文字（父元素、label、前後文字）
+                        var parent = sel.closest('tr, div, li, td');
+                        var textContext = parent ? parent.innerText.toLowerCase() : '';
+                        var labelFor = document.querySelector('label[for="' + sel.id + '"]');
+                        if (labelFor) textContext += ' ' + labelFor.innerText.toLowerCase();
+                        
+                        // 檢查是否包含排除關鍵字
+                        var shouldSkip = skipKeywords.some(function(kw) {
+                            return textContext.indexOf(kw.toLowerCase()) !== -1;
+                        });
+                        
+                        if (shouldSkip) {
+                            skipped++;
+                            return; // 跳過此選單
+                        }
+                        
+                        for (var i = 0; i < sel.options.length; i++) {
+                            if (sel.options[i].value === targetValue) {
+                                sel.selectedIndex = i;
+                                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                changed++;
+                                break;
+                            }
+                        }
+                    });
+                    return {changed: changed, skipped: skipped};
+                """, ticket_count)
+                self.log(f'已透過JS設定 {result["changed"]} 個下拉選單為 {ticket_count} 張（略過 {result["skipped"]} 個特殊票種）')
             except Exception as e:
                 self.log(f'找不到張數下拉選單: {e}')
             
@@ -710,14 +738,20 @@ class TixcraftGUI:
                     self.log('未取得可用驗證碼字元，立即重試')
                     continue
 
-                # 填入並提交
+                # 填入並提交（使用 JS 直接設值，比 send_keys 快）
                 try:
                     captcha_input = WebDriverWait(self.driver, WAIT_CAPTCHA_INPUT).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[name*="verify"], input[id*="verify"], input[placeholder*="驗證"]'))
+                        EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name*="verify"], input[id*="verify"], input[placeholder*="驗證"]'))
                     )
-                    captcha_input.clear()
-                    captcha_input.send_keys(captcha_text)
-                    self.log('驗證碼已填入，立即提交...')
+                    # JS 直接設值比 clear() + send_keys() 快很多
+                    self.driver.execute_script("""
+                        var input = arguments[0];
+                        var value = arguments[1];
+                        input.value = value;
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                    """, captcha_input, captcha_text)
+                    self.log('驗證碼已透過JS填入，立即提交...')
                     # 送出後啟用白名單限制：只在 detail/game/area/captcha 才動作
                     self._after_captcha_submitted = True
                     self._submit_form()
