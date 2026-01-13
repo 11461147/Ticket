@@ -492,89 +492,62 @@ class TixcraftGUI:
             self.log(f'購票資料頁面URL: {current_url}')
             self.log('購票表單已載入完成，開始處理購票資料填寫...')
             
-            # 1. 處理張數下拉選單
+            # 1. 處理張數下拉選單 + checkbox（一次 JS 完成）
             ticket_count = self.ticket_count_entry.get().strip()
             if not ticket_count or not ticket_count.isdigit():
                 ticket_count = "1"
             self.log(f'設定購票張數: {ticket_count}')
             
             try:
-                # 等待下拉選單載入
                 WebDriverWait(self.driver, WAIT_SELECTS).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]'))
                 )
-                # 使用 JS 一次性設定所有下拉選單，比 Selenium 逐一操作快很多
-                # 自動略過輪椅、身障、身心障礙等特殊票種
-                result = self.driver.execute_script("""
-                    var targetValue = arguments[0];
-                    var selects = document.querySelectorAll('select[name*="ticketPrice"], select[id*="ticketPrice"]');
-                    var changed = 0;
-                    var skipped = 0;
-                    // 排除關鍵字（輪椅、身障、身心障礙、陪同、愛心等）
-                    var skipKeywords = ['輪椅', '身障', '身心障礙', '障礙', '陪同', '愛心', '殘障', 'wheelchair', 'disabled'];
-                    
-                    selects.forEach(function(sel) {
-                        // 取得該選單的相關文字（父元素、label、前後文字）
-                        var parent = sel.closest('tr, div, li, td');
-                        var textContext = parent ? parent.innerText.toLowerCase() : '';
-                        var labelFor = document.querySelector('label[for="' + sel.id + '"]');
-                        if (labelFor) textContext += ' ' + labelFor.innerText.toLowerCase();
-                        
-                        // 檢查是否包含排除關鍵字
-                        var shouldSkip = skipKeywords.some(function(kw) {
-                            return textContext.indexOf(kw.toLowerCase()) !== -1;
-                        });
-                        
-                        if (shouldSkip) {
-                            skipped++;
-                            return; // 跳過此選單
-                        }
-                        
-                        for (var i = 0; i < sel.options.length; i++) {
-                            if (sel.options[i].value === targetValue) {
-                                sel.selectedIndex = i;
-                                sel.dispatchEvent(new Event('change', { bubbles: true }));
-                                changed++;
-                                break;
-                            }
-                        }
-                    });
-                    return {changed: changed, skipped: skipped};
-                """, ticket_count)
-                self.log(f'已透過JS設定 {result["changed"]} 個下拉選單為 {ticket_count} 張（略過 {result["skipped"]} 個特殊票種）')
+                self._fill_ticket_form_js(ticket_count)
             except Exception as e:
-                self.log(f'找不到張數下拉選單: {e}')
+                self.log(f'表單處理錯誤: {e}')
             
-            # 2. 安全地處理checkbox - 等待載入後再處理
-            try:
-                checkboxes = WebDriverWait(self.driver, WAIT_CHECKBOXES).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'input[type="checkbox"]'))
-                )
-                self.log(f'找到 {len(checkboxes)} 個checkbox')
-                for i, checkbox in enumerate(checkboxes):
-                    try:
-                        # 檢查checkbox是否可見且可點擊
-                        if checkbox.is_displayed() and checkbox.is_enabled() and not checkbox.is_selected():
-                            # 先嘗試讓checkbox可見
-                            self.driver.execute_script("arguments[0].scrollIntoView(true);", checkbox)
-                            # 使用JS點擊更安全
-                            self.driver.execute_script("arguments[0].click();", checkbox)
-                            self.log(f'勾選checkbox {i+1}')
-                        elif checkbox.is_selected():
-                            self.log(f'checkbox {i+1} 已勾選')
-                        else:
-                            self.log(f'checkbox {i+1} 不可勾選 (disabled或不可見)')
-                    except Exception as e:
-                        self.log(f'checkbox {i+1} 處理失敗: {str(e)[:50]}...')
-            except Exception as e:
-                self.log(f'checkbox處理錯誤: {e}')
-            
-            # 3. 直接等待驗證碼圖片載入並處理
+            # 2. 直接等待驗證碼圖片載入並處理
             self.log('開始處理驗證碼...')
             self._handle_captcha()
             
         except Exception as e:
             self.log(f'購票資料頁面處理錯誤: {e}')
+
+    def _fill_ticket_form_js(self, ticket_count: str, log_result: bool = True):
+        """用 JS 一次性處理下拉選單和 checkbox，略過身障票"""
+        result = self.driver.execute_script("""
+            var targetValue = arguments[0];
+            var selects = document.querySelectorAll('select[name*="ticketPrice"], select[id*="ticketPrice"]');
+            var changed = 0, skipped = 0;
+            selects.forEach(function(sel) {
+                var row = sel.closest('tr');
+                var txt = row ? row.innerText : '';
+                if (txt.indexOf('身障') !== -1 || txt.indexOf('輪椅') !== -1 || 
+                    txt.indexOf('障礙') !== -1 || txt.indexOf('愛心') !== -1 ||
+                    txt.indexOf('陪同') !== -1) {
+                    skipped++;
+                    return;
+                }
+                for (var i = 0; i < sel.options.length; i++) {
+                    if (sel.options[i].value === targetValue) {
+                        sel.selectedIndex = i;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        changed++;
+                        break;
+                    }
+                }
+            });
+            var checkboxes = document.querySelectorAll('input[type="checkbox"]');
+            checkboxes.forEach(function(cb) {
+                if (!cb.checked && !cb.disabled) cb.click();
+            });
+            return {changed: changed, skipped: skipped};
+        """, ticket_count)
+        if log_result:
+            if result["skipped"] > 0:
+                self.log(f'已略過 {result["skipped"]} 個特殊票種（身障/輪椅/愛心）')
+            self.log(f'已設定 {result["changed"]} 個下拉選單為 {ticket_count} 張')
+        return result
 
     def _normalize_captcha(self, text: str) -> str:
         """將 OCR 結果標準化為固定 CAPTCHA_LEN 位：
@@ -795,28 +768,11 @@ class TixcraftGUI:
                         return
                     else:
                         self.log('驗證碼錯誤，立即重試')
-                        # 重新選張/勾選（若需要）
                         try:
-                            selects = self.driver.find_elements(By.CSS_SELECTOR, 'select[name*="ticketPrice"], select[id*="ticketPrice"]')
-                            for select in selects:
-                                try:
-                                    options = select.find_elements(By.TAG_NAME, 'option')
-                                    ticket_count = self.ticket_count_entry.get().strip() or '1'
-                                    for option in options:
-                                        if option.get_attribute('value') == ticket_count:
-                                            option.click()
-                                            break
-                                except Exception:
-                                    continue
-                            checkboxes = self.driver.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]')
-                            for checkbox in checkboxes:
-                                try:
-                                    if checkbox.is_displayed() and checkbox.is_enabled() and not checkbox.is_selected():
-                                        self.driver.execute_script("arguments[0].click();", checkbox)
-                                except Exception:
-                                    continue
-                        except Exception as e:
-                            self.log(f'重新選張/勾選失敗: {e}')
+                            ticket_count = self.ticket_count_entry.get().strip() or '1'
+                            self._fill_ticket_form_js(ticket_count, log_result=False)
+                        except Exception:
+                            pass
                         continue
 
                 except Exception as e:
